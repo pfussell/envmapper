@@ -1,7 +1,7 @@
 # netographer
 
 ## usage
-The single executable Python 3 script, netographer, should be called like this for a list of users and their groups:
+The single executable Python 3 script should be called like this for a list of users and their groups:
 
 ```bash
 ./netographer users <enum4linux_output>
