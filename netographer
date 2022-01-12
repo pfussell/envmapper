@@ -1,0 +1,300 @@
+#!/usr/bin/env python3
+# -*- mode: python -*-
+
+import json
+import os
+import random
+import sys
+
+from collections import OrderedDict
+
+commands = []
+
+# a tasklist is an object representing the data resulting from tasklist.exe
+class TasklistFile(object):
+    def __init__(self, filename):
+        self.filename = filename
+        self.column_headers = None
+        self.processes = []
+
+    def load(self):
+        # reinitialize these in case we have changed the file or filename and
+        # need to reload
+        self.column_headers = None
+        self.processes = []
+
+        with open(self.filename) as file:
+            header_line = None
+            column_widths = None
+
+            for line in file:
+                # remove the trailing newline
+                line = line.rstrip()
+
+                # read header first to know the name and width of each column
+                if not self.column_headers:
+                    # skip blank lines
+                    if not line.rstrip(): continue
+
+                    # save the first non-blank line, these are the column names
+                    if not header_line:
+                        header_line = line
+                        continue
+
+                    # the second non-blank line tells the width of each column
+                    # since the number of consecutive equals signs is equal to the width
+                    column_widths = [len(i) + 1 for i in line.rstrip().split(' ')]
+                    self.column_headers = [i.strip() for i in self._split_columns(header_line, column_widths)]
+
+                    continue
+
+                # the line should contain a row describing a running process now
+                # split on previously calculated column widths and make a dictionary using column headers
+                row = self._split_columns(line, column_widths)
+                row = {column : element.strip() for column, element in zip(self.column_headers, row)}
+
+                self.processes.append(row)
+
+        return self
+
+    def get_user_processes(self):
+        if not self.processes:
+            return {}
+
+        if ('User Name' not in self.column_headers
+            or 'Image Name' not in self.column_headers):
+            raise Exception('input file, {}, is missing columns "User Name" or "Image Name"'.format(self.filename))
+
+        users = set([i['User Name'] for i in self.processes])
+        user_processes = {user : {i['Image Name'] for i in self.processes if i['User Name'] == user} for user in users}
+
+        return user_processes
+
+    def _split_columns(self, string, widths):
+        result = []
+        cumulative_width = 0
+
+        for width in widths:
+            end = cumulative_width + width
+            result.append(string[cumulative_width:end])
+            cumulative_width = end
+
+        return result
+
+class Enum4LinuxFile(object):
+    def __init__(self, filename):
+        self.filename = filename
+        self.domain = None
+        self.users = {}
+        self.groups = {}
+
+    def load(self):
+        with open(self.filename) as file:
+            num_lines = 0
+            current_section = None
+            previous_lines = []
+
+            for line in file:
+                num_lines += 1
+                if len(previous_lines) > 2:
+                    previous_lines = previous_lines[1:]
+                previous_lines.append(line.rstrip())
+                if line.startswith(' =') and previous_lines[0].startswith(' =') and previous_lines[1].startswith('| '):
+                    current_section = previous_lines[1][1:-1].strip()
+                    continue
+                if current_section:
+                    self.parse_section_line(current_section, line.rstrip())
+
+        return self
+
+    def parse_section_line(self, section, line):
+        if section.startswith('Enumerating Workgroup/Domain') or section.startswith('Session Check'):
+            if line.startswith('[+] Got domain/workgroup name:'):
+                self.domain = line.split(' ')[-1]
+        elif section.startswith('Users on'):
+            if line.startswith('user:'):
+                user, rid = line.split(' rid:')
+                user = '{}\\{}'.format(self.domain, user[6:-1])
+                rid = rid[1:-1]
+                self.users[user] = []
+        elif section.startswith('Groups on'):
+            if line.startswith('group:'):
+                group, rid = line.split(' rid:')
+                group = '{}\\{}'.format(self.domain, group[7:-1])
+                rid = rid[1:-1]
+                self.groups[group] = []
+            elif line.startswith('Group \'') and ' has member: ' in line and not line.endswith('Couldn\'t lookup SIDs'):
+                group, member = line.split(' has member: ')
+                group = '{}\\{}'.format(self.domain, group[6:].split(' (RID: ')[0][1:-1])
+                if member in self.users:
+                    self.groups[group].append(member)
+                    self.users[member].append(group)
+                elif member in self.groups:
+                    pass
+
+# given a dictionary of users and their associated processes, return a
+# dictionary of the number of times each process occurs
+def calculate_process_counts(user_processes):
+    process_counts = {}
+    for user in user_processes:
+        for process in user_processes[user]:
+            if process not in process_counts:
+                process_counts[process] = 0
+            process_counts[process] += 1
+    return process_counts
+
+# given a dictionary of users and their associated processes, return a
+# dictionary of the frequency of each process from 0 to 1
+def calculate_process_frequencies(user_processes):
+    process_counts = calculate_process_counts(user_processes)
+    return {process : process_counts[process] / float(len(user_processes)) for process in process_counts}
+
+def metric_weighted_processes_in_common(user_processes_a, user_processes_b, weights):
+    difference = 0
+
+    for weight, process_a, process_b in zip(weights, user_processes_a, user_processes_b):
+        difference += weight * abs(process_a - process_b)
+
+    return difference
+
+def order_process_counts(process_counts):
+    key = lambda p: (-p[1], p[0].lower())
+    ordered_process_counts = sorted([(process, process_counts[process]) for process in process_counts], key=key)
+    return OrderedDict(ordered_process_counts)
+
+def command_processes(args):
+    if len(args) < 1:
+        print('usage: {} processes <tasklists_directory>'.format(__file__))
+        return
+
+    tasklists_directory = args[0]
+    combined_user_processes = {}
+
+    for tasklist in os.listdir(tasklists_directory):
+        tasklist_path = os.path.join(tasklists_directory, tasklist)
+        user_processes = {}
+
+        try:
+            user_processes = TasklistFile(tasklist_path).load().get_user_processes()
+        except:
+            pass
+
+        for user in user_processes:
+            if user not in combined_user_processes:
+                combined_user_processes[user] = set()
+            for process in user_processes[user]:
+                combined_user_processes[user].add(process)
+
+    for user in combined_user_processes:
+        combined_user_processes[user] = list(sorted(combined_user_processes[user]))
+
+    process_counts = calculate_process_counts(combined_user_processes)
+    #print(json.dumps(order_process_counts(process_counts)))
+
+    return combined_user_processes
+
+def command_users(args):
+    if len(args) < 1:
+        print('usage: {} users <enum4linux_output>'.format(__file__))
+        return
+
+    filename = args[0]
+    enum4linux = Enum4LinuxFile(filename).load()
+    print(json.dumps(enum4linux.users))
+
+def command_groups(args):
+    if len(args) < 1:
+        print('usage: {} groups <enum4linux_output>'.format(__file__))
+        return
+
+    filename = args[0]
+    enum4linux = Enum4LinuxFile(filename).load()
+    print(json.dumps(enum4linux.groups))
+
+def command_cluster(args):
+    if len(args) < 1:
+        print('usage: {} cluster <processlists_directory>'.format(__file__))
+        return
+
+    from matplotlib import pyplot
+    from scipy.cluster.hierarchy import dendrogram, fcluster, linkage
+
+    tasklists_directory = args[0]
+    user_processes = command_processes([tasklists_directory])
+
+    # filter out processes only running for one users since it doesn't tell us anything
+    process_counts = calculate_process_counts(user_processes)
+    single_user_processes = set([process for process in process_counts if process_counts[process] == 1])
+    remaining_processes = {process : i for i, process in enumerate(sorted(process_counts)) if process not in single_user_processes}
+    X = []
+
+    for user in user_processes:
+        process_vector = [1 if process in user_processes[user] else 0 for i, process in enumerate(sorted(remaining_processes))]
+        X.append(process_vector)
+        user_processes[user] = list(sorted(set(user_processes[user]) - single_user_processes))
+
+    process_frequencies = calculate_process_frequencies(user_processes)
+    process_frequencies = [process_frequencies[process] for process in sorted(remaining_processes)]
+
+    metric = lambda a, b: metric_weighted_processes_in_common(a, b, process_frequencies)
+    results = linkage(X, 'weighted', metric)
+
+    pyplot.figure(figsize=(25,10))
+    pyplot.title('User Clusters')
+    pyplot.xlabel('User Index')
+    pyplot.ylabel('Distance')
+    dendrogram(results)
+    #pyplot.show()
+
+    users = list(user_processes)
+    result = OrderedDict()
+
+    for k in range(2, 11):
+        clusters = fcluster(results, k, criterion='maxclust')
+        cluster_users = {i : {} for i in range(k)}
+        result[k] = OrderedDict()
+
+        for user_index, user_cluster in enumerate(clusters):
+            user = users[user_index]
+            cluster_users[user_cluster - 1][user] = user_processes[user]
+
+        for cluster in range(k):
+            cluster_process_frequencies = calculate_process_frequencies(cluster_users[cluster])
+            cluster_process_frequencies = list(reversed(sorted([(cluster_process_frequencies[process], process) for process in cluster_process_frequencies])))
+            result[k][cluster] = OrderedDict([(i[1], i[0]) for i in cluster_process_frequencies[:15]])
+
+    print(json.dumps(result))
+
+commands = [
+    ('cluster', command_cluster),
+    ('groups', command_groups),
+    ('processes', command_processes),
+    ('users', command_users)
+]
+
+def print_usage():
+    print('usage: {} <command> [<args>]'.format(__file__))
+    print()
+    print('possible commands are:')
+    for command in commands:
+        print('   {}'.format(command[0]))
+
+def main():
+    args = sys.argv
+
+    if len(args) < 2:
+        print_usage()
+        return
+
+    command = args[1]
+    match = next((i for i in commands if i[0] == command), None)
+
+    if match is None:
+        print_usage()
+        return
+
+    remaining_args = args[2:]
+    match[1](remaining_args)
+
+if __name__ == '__main__':
+    main()
