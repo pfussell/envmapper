@@ -8,15 +8,15 @@ Once we have access to a network, we can execute arbitrary commands on discovere
 
 After running tasklist.exe on every workstation and saving the results to a local directory, it's easy enough to grep through every file and find specific processes, but what if we don't even know what we're looking for? Every organization is different and our goals might be different on each penetration test so we need a way to get some high level data about all of the computers. We wrote a command-line tool called netographer (**note: the name isn't very good, what should we call it?**) which can provide us such information and more.
 
-### Netographer - users/groups
+### users/groups
 
 The utility enum4linux enumerates all of the users in a domain and the groups to which they are assigned. Netographer can parse this file and return a JSON object mapping either users to an array of groups they are in or groups to an array of users in that group. These are the users and groups commands respectively. Because we don't always have time or permission to run enum4linux, we can also use a list of files showing logged-in-users as the source data for this command (but we will be missing group membership).
 
-### Netographer - processes
+### processes
 
 Once we've looked at the users and groups for anything interesting, we can get a high-level view of all running processes on the network. The processes command will parse input tasklists and return a JSON object containing an array of all processes and how many times they occurred (called "process-counts"), an array of all processes and their frequency from 0 to 1 (called "process-frequencies"), and a sub-object representing all users and their running tasks (called "users"). If the output from the users command is piped into this command, the set of users will be restricted to those from the piped users object. Otherwise, the users will be the set of users from every tasklist.
 
-### Netographer - cluster
+### cluster
 
 This is the fun one. The output from the previous commands is useful, but in very largs organizations even reading through those can be unmanagable. What if we could group users by the processes they are running and then invesitage each group? Two users running devenv.exe (Visual Studio), are probably doing similar kind of work and have access to similar kinds of business data. Two users running dwm.exe (Desktop Windows Manager) are probably not very similar because almost every Windows computer has that process.
 
